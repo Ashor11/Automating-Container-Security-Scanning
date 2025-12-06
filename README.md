@@ -5,7 +5,9 @@
 🔒 Container Security Scan Pipeline
 An enterprise-grade Azure DevOps pipeline for automated container vulnerability scanning using Trivy.
 Automate security scanning, generate compliance reports, send alerts, and maintain audit trails for container images.
+
 ![Uploading trivy project .png…]()
+
 
 ---
 
