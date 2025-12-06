@@ -1,0 +1,982 @@
+# =========================
+# Security Scan Template
+# =========================
+
+parameters:
+  - name: baseImageRepo
+    type: string
+    default: ''
+  - name: registryUsername
+    type: string
+    default: ''
+  - name: registryPassword
+    type: string
+    default: ''
+  - name: scanName
+    type: string
+    default: 'Security Scan'
+  - name: excludedTags
+    type: object
+    default: ['python-base3.10.0', 'python-3.10.0']
+  - name: resultsDir
+    type: string
+    default: 'trivy-results'
+  - name: cacheDir
+    type: string
+    default: '/cache'
+  - name: trivyVersion
+    type: string
+    default: 'latest'
+  - name: shouldPublishHtml
+    type: boolean
+    default: false
+  - name: alertThresholdHigh
+    type: number
+    default: 1
+    description: 'Minimum number of HIGH severity vulnerabilities to trigger email alert'
+  - name: alertThresholdCritical
+    type: number
+    default: 1
+    description: 'Minimum number of CRITICAL severity vulnerabilities to trigger email alert'
+  - name: emailRecipients
+    type: string
+    default: ''
+    description: 'Comma-separated list of email recipients for alerts'
+
+variables:
+  trivyImage: 'aquasec/trivy:$(trivyVersion)'
+  companyProxyDomain: '$(COMPANY_PROXY_DOMAIN)'
+  internalRegistryDomain: '$(INTERNAL_REGISTRY_DOMAIN)'
+
+steps:
+  - checkout: none
+
+  # Cleanup previous runs
+  - script: |
+      echo "Cleaning up previous scan results..."
+      rm -rf ${{ parameters.resultsDir }}
+      rm -f all-tags.txt repo-info.txt scan-results.csv high-vuln-tags.csv
+      mkdir -p ${{ parameters.resultsDir }}
+      HTML_DIR="html-reports"
+      mkdir -p "$HTML_DIR"
+      echo "##vso[task.setvariable variable=htmlDir]$HTML_DIR"
+      echo "Cleanup completed. Fresh directories created."
+    displayName: 'Cleanup Previous Runs'
+
+  # Login to registry
+  - script: |
+      unset HTTP_PROXY
+      unset HTTPS_PROXY
+      export NO_PROXY=$(NO_PROXY),$(internalRegistryDomain)
+      
+      echo "Logging into registry: ${{ parameters.baseImageRepo }}"
+      docker login ${{ parameters.baseImageRepo }} -u ${{ parameters.registryUsername }} --password-stdin <<< "${{ parameters.registryPassword }}"
+      
+      if [ $? -eq 0 ]; then
+        echo "Successfully logged into registry"
+      else
+        echo "Failed to login to registry"
+        exit 1
+      fi
+    displayName: 'Login to Registry'
+
+  # Get all tags from the repository
+  - script: |
+      unset HTTP_PROXY
+      unset HTTPS_PROXY
+      export NO_PROXY=$(NO_PROXY),$(internalRegistryDomain)
+      
+      if [[ "${{ parameters.baseImageRepo }}" == *"/"* ]]; then
+        REGISTRY=$(echo "${{ parameters.baseImageRepo }}" | cut -d'/' -f1)
+        REPO_PATH=$(echo "${{ parameters.baseImageRepo }}" | cut -d'/' -f2-)
+      else
+        REGISTRY="${{ parameters.baseImageRepo }}"
+        REPO_PATH=""
+      fi
+      
+      echo "Repository path: $REPO_PATH"
+      
+      curl -s -k -u "${{ parameters.registryUsername }}:${{ parameters.registryPassword }}" \
+        "https://$REGISTRY/api/v1/repository/$REPO_PATH/tag/" | jq -r '.tags[].name' > all-tags.txt
+      
+      TOTAL_TAGS=$(wc -l < all-tags.txt)
+      echo "Found $TOTAL_TAGS tags in repository"
+      echo "Tags list:"
+      echo "----------------------------------------"
+      cat all-tags.txt
+      echo "----------------------------------------"
+      
+      echo "REPOSITORY_NAME=${{ parameters.scanName }}" > repo-info.txt
+      echo "REPOSITORY_URL=${{ parameters.baseImageRepo }}" >> repo-info.txt
+      echo "TOTAL_TAGS=$TOTAL_TAGS" >> repo-info.txt
+    displayName: 'Fetch Repository Tags'
+    continueOnError: true
+
+  # Install jq for JSON parsing
+  - script: |
+      if ! command -v jq &> /dev/null; then
+        echo "Installing jq for JSON parsing..."
+        yum install -y jq
+      fi
+    displayName: 'Install jq'
+
+  # Pull images with detailed logging
+  - script: |
+      unset HTTP_PROXY
+      unset HTTPS_PROXY
+      
+      echo "Starting image pull process..."
+      PULL_SUCCESS=0
+      PULL_FAILED=0
+      PULL_SKIPPED=0
+      
+      while IFS= read -r TAG; do
+        skip_tag=false
+        for excluded_tag in ${{ join(' ', parameters.excludedTags) }}; do
+          if [ "$TAG" = "$excluded_tag" ]; then
+            skip_tag=true
+            break
+          fi
+        done
+        
+        if [ "$skip_tag" = true ]; then
+          echo "SKIPPED: $TAG (excluded)"
+          PULL_SKIPPED=$((PULL_SKIPPED + 1))
+          continue
+        fi
+        
+        IMAGE="${{ parameters.baseImageRepo }}:$TAG"
+        echo "PULLING: $IMAGE"
+        
+        if docker pull "$IMAGE" --quiet; then
+          echo "SUCCESS: Pulled $TAG"
+          PULL_SUCCESS=$((PULL_SUCCESS + 1))
+        else
+          echo "FAILED: Could not pull $TAG"
+          PULL_FAILED=$((PULL_FAILED + 1))
+        fi
+        
+      done < all-tags.txt
+      
+      echo "Pull Summary:"
+      echo "  Success: $PULL_SUCCESS"
+      echo "  Failed: $PULL_FAILED" 
+      echo "  Skipped: $PULL_SKIPPED"
+    displayName: 'Pull Container Images'
+    continueOnError: true
+
+  # Security scan with Trivy
+  - script: |
+      export HTTP_PROXY=$(HTTP_PROXY)
+      export HTTPS_PROXY=$(HTTPS_PROXY)
+      export NO_PROXY=$(NO_PROXY),$(internalRegistryDomain)
+      
+      echo "Starting security scan..."
+      
+      REPO_CRITICAL=0
+      REPO_HIGH=0
+      REPO_MEDIUM=0
+      REPO_LOW=0
+      REPO_UNKNOWN=0
+      SCAN_SUCCESS=0
+      SCAN_FAILED=0
+      SCAN_SKIPPED=0
+      
+      # Create CSV files for tag details and high vulnerability tags
+      echo "IMAGE_TAG,STATUS,CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN,TOTAL" > scan-results.csv
+      echo "IMAGE_TAG,SEVERITY,COUNT,SCAN_STATUS" > high-vuln-tags.csv
+      
+      while IFS= read -r TAG; do
+        skip_tag=false
+        for excluded_tag in ${{ join(' ', parameters.excludedTags) }}; do
+          if [ "$TAG" = "$excluded_tag" ]; then
+            skip_tag=true
+            break
+          fi
+        done
+        
+        if [ "$skip_tag" = true ]; then
+          echo "SKIPPED: $TAG (excluded)"
+          SCAN_SKIPPED=$((SCAN_SKIPPED + 1))
+          echo "$TAG,SKIPPED,0,0,0,0,0,0" >> scan-results.csv
+          continue
+        fi
+        
+        IMAGE="${{ parameters.baseImageRepo }}:$TAG"
+        JSON_OUTPUT_FILE="${{ parameters.resultsDir }}/trivy-${TAG}.json"
+        TABLE_OUTPUT_FILE="${{ parameters.resultsDir }}/trivy-${TAG}.txt"
+        
+        echo "SCANNING: $TAG"
+        
+        # Run Trivy with JSON format first
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v "${{ parameters.cacheDir }}:/root/.cache/trivy" \
+          -e HTTP_PROXY="$HTTP_PROXY" \
+          -e HTTPS_PROXY="$HTTPS_PROXY" \
+          -e NO_PROXY="$NO_PROXY" \
+          $(trivyImage) \
+          image --format json \
+          --timeout 10m \
+          --cache-dir /root/.cache/trivy \
+          "$IMAGE" > "$JSON_OUTPUT_FILE"
+        
+        SCAN_EXIT_CODE=$?
+        
+        if [ $SCAN_EXIT_CODE -eq 0 ] && [ -s "$JSON_OUTPUT_FILE" ]; then
+          SCAN_SUCCESS=$((SCAN_SUCCESS + 1))
+          
+          # Parse JSON output for accurate vulnerability counts
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "$JSON_OUTPUT_FILE" 2>/dev/null || echo "0")
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "$JSON_OUTPUT_FILE" 2>/dev/null || echo "0")
+          MEDIUM_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' "$JSON_OUTPUT_FILE" 2>/dev/null || echo "0")
+          LOW_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "LOW")] | length' "$JSON_OUTPUT_FILE" 2>/dev/null || echo "0")
+          UNKNOWN_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "UNKNOWN")] | length' "$JSON_OUTPUT_FILE" 2>/dev/null || echo "0")
+          TOTAL_COUNT=$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT + UNKNOWN_COUNT))
+          
+          echo "VULNERABILITIES - $TAG: Critical=$CRITICAL_COUNT, High=$HIGH_COUNT, Medium=$MEDIUM_COUNT, Low=$LOW_COUNT, Unknown=$UNKNOWN_COUNT"
+          
+          # Write to CSV
+          echo "$TAG,SUCCESS,$CRITICAL_COUNT,$HIGH_COUNT,$MEDIUM_COUNT,$LOW_COUNT,$UNKNOWN_COUNT,$TOTAL_COUNT" >> scan-results.csv
+          
+          # Check for high/critical vulnerabilities and add to alert list
+          if [ $CRITICAL_COUNT -ge ${{ parameters.alertThresholdCritical }} ]; then
+            echo "$TAG,CRITICAL,$CRITICAL_COUNT,SUCCESS" >> high-vuln-tags.csv
+          fi
+          if [ $HIGH_COUNT -ge ${{ parameters.alertThresholdHigh }} ]; then
+            echo "$TAG,HIGH,$HIGH_COUNT,SUCCESS" >> high-vuln-tags.csv
+          fi
+          
+          # Run Trivy with table format for human-readable output
+          echo "Running Trivy with table format for $TAG..."
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ parameters.cacheDir }}:/root/.cache/trivy" \
+            -e HTTP_PROXY="$HTTP_PROXY" \
+            -e HTTPS_PROXY="$HTTPS_PROXY" \
+            -e NO_PROXY="$NO_PROXY" \
+            $(trivyImage) \
+            image --format table \
+            --timeout 10m \
+            --cache-dir /root/.cache/trivy \
+            "$IMAGE" > "$TABLE_OUTPUT_FILE" 2>&1
+          
+          echo "Table format output saved to: $TABLE_OUTPUT_FILE"
+          
+          # Create individual tag metrics file
+          echo "CRITICAL=$CRITICAL_COUNT" > "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "HIGH=$HIGH_COUNT" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "MEDIUM=$MEDIUM_COUNT" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "LOW=$LOW_COUNT" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "UNKNOWN=$UNKNOWN_COUNT" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "TOTAL=$TOTAL_COUNT" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          
+          REPO_CRITICAL=$((REPO_CRITICAL + CRITICAL_COUNT))
+          REPO_HIGH=$((REPO_HIGH + HIGH_COUNT))
+          REPO_MEDIUM=$((REPO_MEDIUM + MEDIUM_COUNT))
+          REPO_LOW=$((REPO_LOW + LOW_COUNT))
+          REPO_UNKNOWN=$((REPO_UNKNOWN + UNKNOWN_COUNT))
+          
+        else
+          echo "FAILED: Scan for $TAG"
+          SCAN_FAILED=$((SCAN_FAILED + 1))
+          echo "$TAG,FAILED,0,0,0,0,0,0" >> scan-results.csv
+          
+          # Create empty table file for failed scans
+          echo "SCAN FAILED: Could not scan image $IMAGE" > "$TABLE_OUTPUT_FILE"
+          
+          echo "CRITICAL=0" > "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "HIGH=0" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "MEDIUM=0" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "LOW=0" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "UNKNOWN=0" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+          echo "TOTAL=0" >> "${{ parameters.resultsDir }}/trivy-${TAG}.counts"
+        fi
+        
+      done < all-tags.txt
+      
+      echo "SCAN_SUMMARY:"
+      echo "  Successful: $SCAN_SUCCESS"
+      echo "  Failed: $SCAN_FAILED"
+      echo "  Skipped: $SCAN_SKIPPED"
+      echo "VULNERABILITY_SUMMARY:"
+      echo "  Critical: $REPO_CRITICAL"
+      echo "  High: $REPO_HIGH"
+      echo "  Medium: $REPO_MEDIUM"
+      echo "  Low: $REPO_LOW"
+      echo "  Unknown: $REPO_UNKNOWN"
+      echo "  Total: $((REPO_CRITICAL + REPO_HIGH + REPO_MEDIUM + REPO_LOW + REPO_UNKNOWN))"
+      
+      echo "SCAN_SUCCESS=$SCAN_SUCCESS" >> repo-info.txt
+      echo "SCAN_FAILED=$SCAN_FAILED" >> repo-info.txt
+      echo "SCAN_SKIPPED=$SCAN_SKIPPED" >> repo-info.txt
+      echo "TOTAL_CRITICAL=$REPO_CRITICAL" >> repo-info.txt
+      echo "TOTAL_HIGH=$REPO_HIGH" >> repo-info.txt
+      echo "TOTAL_MEDIUM=$REPO_MEDIUM" >> repo-info.txt
+      echo "TOTAL_LOW=$REPO_LOW" >> repo-info.txt
+      echo "TOTAL_UNKNOWN=$REPO_UNKNOWN" >> repo-info.txt
+      echo "TOTAL_VULNERABILITIES=$((REPO_CRITICAL + REPO_HIGH + REPO_MEDIUM + REPO_LOW + REPO_UNKNOWN))" >> repo-info.txt
+      
+      # Count high vulnerability tags
+      HIGH_VULN_COUNT=$(tail -n +2 high-vuln-tags.csv | wc -l | tr -d ' ')
+      echo "HIGH_VULN_TAGS_COUNT=$HIGH_VULN_COUNT" >> repo-info.txt
+    displayName: 'Security Scan'
+    continueOnError: true
+
+  # Email Alert for High Vulnerability Tags
+  - task: Bash@3
+    displayName: 'Check for High Vulnerability Tags'
+    condition: and(succeededOrFailed(), ne('${{ parameters.emailRecipients }}', ''))
+    inputs:
+      targetType: 'inline'
+      script: |
+        # Check if high-vuln-tags.csv has any entries (excluding header)
+        if [ -f high-vuln-tags.csv ]; then
+          LINE_COUNT=$(wc -l < high-vuln-tags.csv)
+          if [ $LINE_COUNT -gt 1 ]; then
+            echo "##vso[task.setvariable variable=hasHighVulnTags]true"
+            
+            # Prepare email content
+            source repo-info.txt
+            
+            echo "Preparing email alert for high vulnerability tags..."
+            
+            EMAIL_SUBJECT="[SECURITY ALERT] High/Critical Vulnerabilities Found in $REPOSITORY_NAME"
+            
+            EMAIL_BODY="<!DOCTYPE html>
+            <html>
+            <head>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 20px; }
+                    .header { background-color: #f2dede; color: #a94442; padding: 15px; border-radius: 5px; }
+                    .content { margin: 20px 0; }
+                    .stats { background-color: #f9f9f9; padding: 15px; border-left: 4px solid #337ab7; }
+                    .vuln-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+                    .vuln-table th { background-color: #f5f5f5; padding: 10px; text-align: left; }
+                    .vuln-table td { padding: 10px; border-bottom: 1px solid #ddd; }
+                    .critical { color: #d9534f; font-weight: bold; }
+                    .high { color: #f0ad4e; font-weight: bold; }
+                    .info { color: #5bc0de; }
+                </style>
+            </head>
+            <body>
+                <div class='header'>
+                    <h2>⚠️ Security Vulnerability Alert</h2>
+                </div>
+                
+                <div class='content'>
+                    <p>High or critical severity vulnerabilities have been detected in the following container images:</p>
+                    
+                    <div class='stats'>
+                        <h3>Scan Summary</h3>
+                        <p><strong>Repository:</strong> $REPOSITORY_NAME</p>
+                        <p><strong>Repository URL:</strong> $REPOSITORY_URL</p>
+                        <p><strong>Total Images Scanned:</strong> $TOTAL_TAGS</p>
+                        <p><strong>Total Vulnerabilities Found:</strong> $TOTAL_VULNERABILITIES</p>
+                        <p><strong>Critical:</strong> <span class='critical'>$TOTAL_CRITICAL</span></p>
+                        <p><strong>High:</strong> <span class='high'>$TOTAL_HIGH</span></p>
+                        <p><strong>Images with High/Critical Vulns:</strong> $HIGH_VULN_TAGS_COUNT</p>
+                    </div>
+                    
+                    <h3>Affected Images:</h3>
+                    <table class='vuln-table'>
+                        <thead>
+                            <tr>
+                                <th>Image Tag</th>
+                                <th>Severity</th>
+                                <th>Count</th>
+                            </tr>
+                        </thead>
+                        <tbody>"
+            
+            # Add rows for each high vulnerability tag
+            while IFS=, read -r TAG SEVERITY COUNT STATUS; do
+              if [ "$TAG" != "IMAGE_TAG" ]; then
+                SEVERITY_CLASS=$(echo "$SEVERITY" | tr '[:upper:]' '[:lower:]')
+                EMAIL_BODY="$EMAIL_BODY
+                            <tr>
+                                <td><strong>$TAG</strong></td>
+                                <td class='$SEVERITY_CLASS'>$SEVERITY</td>
+                                <td>$COUNT</td>
+                            </tr>"
+              fi
+            done < high-vuln-tags.csv
+            
+            EMAIL_BODY="$EMAIL_BODY
+                        </tbody>
+                    </table>
+                    
+                    <p class='info'>⚠️ <strong>Action Required:</strong> Please review the detailed scan report and take appropriate remediation actions.</p>
+                    
+                    <p>For detailed information, refer to the complete security report in the pipeline artifacts.</p>
+                    
+                    <p><strong>Next Steps:</strong></p>
+                    <ul>
+                        <li>Review the vulnerabilities in the detailed report</li>
+                        <li>Update base images to patched versions where available</li>
+                        <li>Apply security patches to affected containers</li>
+                        <li>Consider replacing vulnerable packages</li>
+                    </ul>
+                    
+                    <p>This is an automated alert from the Container Security Scan Pipeline.</p>
+                </div>
+            </body>
+            </html>"
+            
+            # Write email body to file
+            echo "$EMAIL_BODY" > email-alert.html
+            
+            # Also create a plain text version
+            PLAIN_TEXT="SECURITY ALERT - High/Critical Vulnerabilities Found
+            ========================================================
+            
+            Repository: $REPOSITORY_NAME
+            Repository URL: $REPOSITORY_URL
+            Scan Date: $(date)
+            
+            SUMMARY:
+            - Total Images: $TOTAL_TAGS
+            - Total Vulnerabilities: $TOTAL_VULNERABILITIES
+            - Critical: $TOTAL_CRITICAL
+            - High: $TOTAL_HIGH
+            - Images with High/Critical Vulnerabilities: $HIGH_VULN_TAGS_COUNT
+            
+            AFFECTED IMAGES:
+            -----------------"
+            
+            while IFS=, read -r TAG SEVERITY COUNT STATUS; do
+              if [ "$TAG" != "IMAGE_TAG" ]; then
+                PLAIN_TEXT="$PLAIN_TEXT
+            - $TAG: $COUNT $SEVERITY severity vulnerabilities"
+              fi
+            done < high-vuln-tags.csv
+            
+            PLAIN_TEXT="$PLAIN_TEXT
+            
+            ACTION REQUIRED:
+            Please review the detailed scan report and take appropriate remediation actions.
+            
+            This is an automated alert from the Container Security Scan Pipeline."
+            
+            echo "$PLAIN_TEXT" > email-alert.txt
+            
+            echo "Email content prepared"
+            echo "##vso[task.setvariable variable=emailSubject]$EMAIL_SUBJECT"
+            echo "##vso[task.setvariable variable=hasAlerts]true"
+          else
+            echo "No high vulnerability tags found"
+            echo "##vso[task.setvariable variable=hasHighVulnTags]false"
+          fi
+        else
+          echo "high-vuln-tags.csv not found"
+          echo "##vso[task.setvariable variable=hasHighVulnTags]false"
+        fi
+    env:
+      EMAIL_RECIPIENTS: ${{ parameters.emailRecipients }}
+
+  # Send Email Alert
+  - task: SendEmail@1
+    displayName: 'Send Email Alert for High Vulnerabilities'
+    condition: and(succeededOrFailed(), eq(variables.hasHighVulnTags, 'true'), ne('${{ parameters.emailRecipients }}', ''))
+    inputs:
+      to: '${{ parameters.emailRecipients }}'
+      subject: '$(emailSubject)'
+      body: '$(System.DefaultWorkingDirectory)/email-alert.html'
+      bodyAsHtml: true
+      importance: 'High'
+      attachFile: '$(System.DefaultWorkingDirectory)/email-alert.txt'
+
+  # Generate repository report with tag details table
+  - script: |
+      echo "Generating repository report with tag details..."
+      
+      source repo-info.txt
+      
+      # Create individual repository HTML report
+      HTML_FILE="$(htmlDir)/${{ parameters.scanName }}-security-report.html"
+      
+      cat > "$HTML_FILE" << EOF
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Security Report - ${{ parameters.scanName }} </title>
+          <style>
+              :root {
+                  --critical: #dc3545;
+                  --high: #fd7e14;
+                  --medium: #ffc107;
+                  --low: #20c997;
+                  --unknown: #6c757d;
+                  --success: #28a745;
+                  --failed: #dc3545;
+                  --skipped: #6c757d;
+              }
+              
+              body {
+                  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                  background-color: #f8f9fa;
+                  margin: 0;
+                  padding: 20px;
+                  color: #333;
+              }
+              
+              .container {
+                  max-width: 1400px;
+                  margin: 0 auto;
+                  background: white;
+                  border-radius: 8px;
+                  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                  overflow: hidden;
+              }
+              
+              .header {
+                  background: #2c3e50;
+                  color: white;
+                  padding: 2rem;
+                  text-align: center;
+              }
+              
+              .header h1 {
+                  margin: 0 0 0.5rem 0;
+                  font-weight: 600;
+              }
+              
+              .header .subtitle {
+                  opacity: 0.9;
+                  font-size: 1.1rem;
+              }
+              
+              .overview {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                  gap: 1rem;
+                  padding: 2rem;
+                  background: #f8f9fa;
+              }
+              
+              .stat-card {
+                  background: white;
+                  padding: 1.5rem;
+                  border-radius: 8px;
+                  text-align: center;
+                  box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+              }
+              
+              .stat-card.critical { border-top: 4px solid var(--critical); }
+              .stat-card.high { border-top: 4px solid var(--high); }
+              .stat-card.medium { border-top: 4px solid var(--medium); }
+              .stat-card.low { border-top: 4px solid var(--low); }
+              .stat-card.unknown { border-top: 4px solid var(--unknown); }
+              
+              .stat-number {
+                  font-size: 2rem;
+                  font-weight: bold;
+                  margin-bottom: 0.5rem;
+              }
+              
+              .critical .stat-number { color: var(--critical); }
+              .high .stat-number { color: var(--high); }
+              .medium .stat-number { color: var(--medium); }
+              .low .stat-number { color: var(--low); }
+              .unknown .stat-number { color: var(--unknown); }
+              
+              .details {
+                  padding: 2rem;
+              }
+              
+              .section {
+                  margin-bottom: 2rem;
+              }
+              
+              .section h3 {
+                  color: #2c3e50;
+                  margin-bottom: 1rem;
+                  font-weight: 600;
+              }
+              
+              .info-grid {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                  gap: 1rem;
+                  margin-bottom: 1.5rem;
+              }
+              
+              .info-item {
+                  display: flex;
+                  justify-content: space-between;
+                  padding: 0.75rem;
+                  background: #f8f9fa;
+                  border-radius: 6px;
+              }
+              
+              .info-label {
+                  font-weight: 500;
+                  color: #6c757d;
+              }
+              
+              .info-value {
+                  font-weight: 600;
+              }
+              
+              .vuln-grid {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+                  gap: 0.5rem;
+                  margin-top: 1rem;
+              }
+              
+              .vuln-item {
+                  padding: 1rem;
+                  border-radius: 6px;
+                  text-align: center;
+                  font-weight: 500;
+              }
+              
+              .vuln-critical { background: var(--critical); color: white; }
+              .vuln-high { background: var(--high); color: white; }
+              .vuln-medium { background: var(--medium); color: black; }
+              .vuln-low { background: var(--low); color: white; }
+              .vuln-unknown { background: var(--unknown); color: white; }
+              
+              .table-container {
+                  overflow-x: auto;
+                  margin-top: 1rem;
+              }
+              
+              table {
+                  width: 100%;
+                  border-collapse: collapse;
+                  margin-top: 1rem;
+              }
+              
+              th {
+                  background: #2c3e50;
+                  color: white;
+                  padding: 1rem;
+                  text-align: left;
+                  font-weight: 600;
+              }
+              
+              td {
+                  padding: 1rem;
+                  border-bottom: 1px solid #dee2e6;
+              }
+              
+              tr:hover {
+                  background: #f8f9fa;
+              }
+              
+              .status-success { color: var(--success); font-weight: 600; }
+              .status-failed { color: var(--failed); font-weight: 600; }
+              .status-skipped { color: var(--skipped); font-weight: 600; }
+              
+              .vuln-cell {
+                  text-align: center;
+                  font-weight: 600;
+                  padding: 0.25rem 0.5rem;
+                  border-radius: 4px;
+                  display: inline-block;
+                  min-width: 30px;
+              }
+              
+              .vuln-cell-critical { background: var(--critical); color: white; }
+              .vuln-cell-high { background: var(--high); color: white; }
+              .vuln-cell-medium { background: var(--medium); color: black; }
+              .vuln-cell-low { background: var(--low); color: white; }
+              .vuln-cell-unknown { background: var(--unknown); color: white; }
+              
+              .timestamp {
+                  text-align: center;
+                  padding: 1rem;
+                  color: #6c757d;
+                  border-top: 1px solid #dee2e6;
+              }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <div class="header">
+                  <h1>Security Report</h1>
+                  <div class="subtitle">${{ parameters.scanName }}</div>
+              </div>
+              
+              <div class="overview">
+                  <div class="stat-card critical">
+                      <div class="stat-number">$TOTAL_CRITICAL</div>
+                      <div>Critical</div>
+                  </div>
+                  <div class="stat-card high">
+                      <div class="stat-number">$TOTAL_HIGH</div>
+                      <div>High</div>
+                  </div>
+                  <div class="stat-card medium">
+                      <div class="stat-number">$TOTAL_MEDIUM</div>
+                      <div>Medium</div>
+                  </div>
+                  <div class="stat-card low">
+                      <div class="stat-number">$TOTAL_LOW</div>
+                      <div>Low</div>
+                  </div>
+                  <div class="stat-card unknown">
+                      <div class="stat-number">$TOTAL_UNKNOWN</div>
+                      <div>Unknown</div>
+                  </div>
+              </div>
+              
+              <div class="details">
+                  <div class="section">
+                      <h3>Repository Information</h3>
+                      <div class="info-grid">
+                          <div class="info-item">
+                              <span class="info-label">Repository Name</span>
+                              <span class="info-value">${{ parameters.scanName }}</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="info-label">Total Images</span>
+                              <span class="info-value">$TOTAL_TAGS</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="info-label">Scan Date</span>
+                              <span class="info-value">$(date '+%Y-%m-%d %H:%M:%S')</span>
+                          </div>
+                      </div>
+                  </div>
+                  
+                  <div class="section">
+                      <h3>Scan Results</h3>
+                      <div class="info-grid">
+                          <div class="info-item">
+                              <span class="info-label">Successful Scans</span>
+                              <span class="info-value">$SCAN_SUCCESS</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="info-label">Failed Scans</span>
+                              <span class="info-value">$SCAN_FAILED</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="info-label">Skipped Scans</span>
+                              <span class="info-value">$SCAN_SKIPPED</span>
+                          </div>
+                          <div class="info-item">
+                              <span class="info-label">Total Vulnerabilities</span>
+                              <span class="info-value">$TOTAL_VULNERABILITIES</span>
+                          </div>
+                      </div>
+                  </div>
+                  
+                  <div class="section">
+                      <h3>Vulnerability Breakdown</h3>
+                      <div class="vuln-grid">
+                          <div class="vuln-item vuln-critical">
+                              <div>Critical</div>
+                              <div>$TOTAL_CRITICAL</div>
+                          </div>
+                          <div class="vuln-item vuln-high">
+                              <div>High</div>
+                              <div>$TOTAL_HIGH</div>
+                          </div>
+                          <div class="vuln-item vuln-medium">
+                              <div>Medium</div>
+                              <div>$TOTAL_MEDIUM</div>
+                          </div>
+                          <div class="vuln-item vuln-low">
+                              <div>Low</div>
+                              <div>$TOTAL_LOW</div>
+                          </div>
+                          <div class="vuln-item vuln-unknown">
+                              <div>Unknown</div>
+                              <div>$TOTAL_UNKNOWN</div>
+                          </div>
+                      </div>
+                  </div>
+                  
+                  <div class="section">
+                      <h3>Image Tag Details</h3>
+                      <div class="table-container">
+                          <table>
+                              <thead>
+                                  <tr>
+                                      <th>Image Tag</th>
+                                      <th>Status</th>
+                                      <th>Critical</th>
+                                      <th>High</th>
+                                      <th>Medium</th>
+                                      <th>Low</th>
+                                      <th>Unknown</th>
+                                      <th>Total</th>
+                                  </tr>
+                              </thead>
+                              <tbody>
+      EOF
+      
+      # Add table rows from CSV
+      while IFS=, read -r TAG STATUS CRITICAL HIGH MEDIUM LOW UNKNOWN TOTAL; do
+          if [ "$TAG" != "IMAGE_TAG" ]; then
+              STATUS_CLASS="status-${STATUS,,}"
+              cat >> "$HTML_FILE" << EOROW
+                                  <tr>
+                                      <td><strong>$TAG</strong></td>
+                                      <td class="$STATUS_CLASS">$STATUS</td>
+                                      <td><span class="vuln-cell vuln-cell-critical">$CRITICAL</span></td>
+                                      <td><span class="vuln-cell vuln-cell-high">$HIGH</span></td>
+                                      <td><span class="vuln-cell vuln-cell-medium">$MEDIUM</span></td>
+                                      <td><span class="vuln-cell vuln-cell-low">$LOW</span></td>
+                                      <td><span class="vuln-cell vuln-cell-unknown">$UNKNOWN</span></td>
+                                      <td><strong>$TOTAL</strong></td>
+                                  </tr>
+      EOROW
+          fi
+      done < scan-results.csv
+      
+      cat >> "$HTML_FILE" << EOF
+                              </tbody>
+                          </table>
+                      </div>
+                  </div>
+                  
+                  $([ "$HIGH_VULN_TAGS_COUNT" -gt 0 ] && echo "
+                  <div class=\"section\">
+                      <h3>⚠️ High/Critical Vulnerability Alerts</h3>
+                      <div class=\"table-container\">
+                          <table>
+                              <thead>
+                                  <tr>
+                                      <th>Image Tag</th>
+                                      <th>Severity</th>
+                                      <th>Count</th>
+                                      <th>Status</th>
+                                  </tr>
+                              </thead>
+                              <tbody>")
+      EOF
+      
+      # Add high vulnerability alerts if any
+      if [ -f high-vuln-tags.csv ] && [ "$HIGH_VULN_TAGS_COUNT" -gt 0 ]; then
+          while IFS=, read -r TAG SEVERITY COUNT STATUS; do
+              if [ "$TAG" != "IMAGE_TAG" ]; then
+                  SEVERITY_CLASS=$(echo "$SEVERITY" | tr '[:upper:]' '[:lower:]')
+                  cat >> "$HTML_FILE" << EOROW
+                                  <tr>
+                                      <td><strong>$TAG</strong></td>
+                                      <td><span class="vuln-cell vuln-cell-$SEVERITY_CLASS">$SEVERITY</span></td>
+                                      <td><strong>$COUNT</strong></td>
+                                      <td class="status-success">$STATUS</td>
+                                  </tr>
+      EOROW
+              fi
+          done < high-vuln-tags.csv
+      fi
+      
+      cat >> "$HTML_FILE" << EOF
+                              </tbody>
+                          </table>
+                      </div>
+                  </div>
+              </div>
+              
+              <div class="timestamp">
+                  <p>Report generated on $(date '+%Y-%m-%d at %H:%M:%S')</p>
+                  <p>Alert Thresholds: Critical ≥ ${{ parameters.alertThresholdCritical }}, High ≥ ${{ parameters.alertThresholdHigh }}</p>
+              </div>
+          </div>
+      </body>
+      </html>
+      EOF
+      
+      echo "Repository report with tag details generated: $HTML_FILE"
+      
+      # Create summary text file
+      echo "Security Scan Summary - $REPOSITORY_NAME" > "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "==========================================" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "Repository: $REPOSITORY_URL" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "Scan Date: $(date '+%Y-%m-%d %H:%M:%S')" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "Scan Statistics:" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Total Images: $TOTAL_TAGS" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Successful Scans: $SCAN_SUCCESS" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Failed Scans: $SCAN_FAILED" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Skipped Scans: $SCAN_SKIPPED" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "Vulnerability Summary:" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Critical: $TOTAL_CRITICAL" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- High: $TOTAL_HIGH" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Medium: $TOTAL_MEDIUM" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Low: $TOTAL_LOW" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Unknown: $TOTAL_UNKNOWN" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Total: $TOTAL_VULNERABILITIES" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "Alert Thresholds:" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Critical Alert Threshold: ${{ parameters.alertThresholdCritical }}" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- High Alert Threshold: ${{ parameters.alertThresholdHigh }}" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      echo "- Images with High/Critical Vulns: $HIGH_VULN_TAGS_COUNT" >> "${{ parameters.resultsDir }}/scan-summary.txt"
+      
+      echo "Summary text file generated: ${{ parameters.resultsDir }}/scan-summary.txt"
+    displayName: 'Generate Security Report'
+
+  # Clean up JSON files and keep only required files
+  - script: |
+      echo "Cleaning up unnecessary files..."
+      
+      # Remove only JSON files (keep HTML, TXT, and CSV files)
+      find "${{ parameters.resultsDir }}" -name "*.json" -type f -delete
+      echo "Removed JSON files"
+      
+      # Remove individual count files (we have the CSV now)
+      find "${{ parameters.resultsDir }}" -name "*.counts" -type f -delete
+      echo "Removed individual count files"
+      
+      # List remaining files for verification
+      echo "Remaining files in results directory:"
+      ls -la "${{ parameters.resultsDir }}"/
+      
+      # Copy important files to keep
+      cp repo-info.txt "${{ parameters.resultsDir }}/"
+      cp scan-results.csv "${{ parameters.resultsDir }}/"
+      cp all-tags.txt "${{ parameters.resultsDir }}/"
+      cp high-vuln-tags.csv "${{ parameters.resultsDir }}/" 2>/dev/null || true
+      
+      echo "Files that will be published to artifacts:"
+      find "${{ parameters.resultsDir }}" -type f -name "*.html" -o -name "*.txt" -o -name "*.csv"
+      
+      echo "Cleanup completed. Only HTML, TXT, and CSV files kept."
+    displayName: 'Cleanup Unnecessary Files'
+    condition: always()
+
+  # Publish only specific file types as artifacts
+  - task: PublishBuildArtifacts@1
+    inputs:
+      PathtoPublish: '${{ parameters.resultsDir }}'
+      ArtifactName: 'security-scan-${{ parameters.scanName }}'
+      publishLocation: 'Container'
+    displayName: 'Publish Scan Results (HTML, TXT, CSV only)'
+    condition: always()
+
+  # Publish repository report
+  - task: PublishHtmlReport@1
+    inputs:
+      htmlPath: '$(htmlDir)'
+      htmlContentFolder: '$(htmlDir)'
+      reportName: '${{ parameters.scanName }}-security-report'
+    displayName: 'Publish Security Report'
+    condition: eq('${{ parameters.shouldPublishHtml }}', 'true')
+
+  # Final cleanup - remove all local directories after artifact publish
+  - script: |
+      echo "Performing final cleanup..."
+      
+      # Remove all created directories and files
+      rm -rf "${{ parameters.resultsDir }}"
+      rm -rf "${{ parameters.cacheDir }}"
+      rm -f all-tags.txt
+      rm -f repo-info.txt
+      rm -f scan-results.csv
+      rm -f high-vuln-tags.csv
+      rm -f email-alert.html email-alert.txt 2>/dev/null || true
+      
+      echo "Final cleanup completed. All temporary files and directories removed."
+      echo "Remaining workspace content:"
+      ls -la
+    displayName: 'Final Cleanup'
+    condition: always()
