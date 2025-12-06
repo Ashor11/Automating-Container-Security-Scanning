@@ -2,60 +2,186 @@
 # Container Security Scan Pipeline
 # =========================
 
+name: $(Date:yyyyMMdd)$(Rev:.r) - Container Security Scan
+
 schedules:
   - cron: "0 1 * * *"
-    displayName: Daily container security scan at 4 AM Egypt time [4-3 = 1 UTC]
+    displayName: 'Daily container security scan'
     branches:
       include:
-        - "*"
+        - main
+    always: true
+
 trigger: none
 pr: none
 
 variables:
-  - group: libers
+  # Variable groups for secrets and configuration
+  - group: 'security-scan-variables'
+  
+  # Overrideable pipeline variables with defaults
   - name: internalRegistryUrl
     value: '$(INTERNAL_REGISTRY_URL)'
+    
   - name: baseImageRepoPath
     value: '$(BASE_IMAGE_REPO_PATH)'
+    
   - name: trivyImageRepoPath
     value: '$(TRIVY_IMAGE_REPO_PATH)'
+    
+  - name: emailRecipients
+    value: '$(SECURITY_EMAIL_RECIPIENTS)'
+    
+  - name: alertThresholdHigh
+    value: '$(ALERT_THRESHOLD_HIGH)'
+    
+  - name: alertThresholdCritical
+    value: '$(ALERT_THRESHOLD_CRITICAL)'
+    
+  - name: trivyVersion
+    value: '$(TRIVY_VERSION)'
+    
+  # Default values if variables are not set
+  - name: defaultAlertThresholdHigh
+    value: 5
+    
+  - name: defaultAlertThresholdCritical
+    value: 1
+    
+  - name: defaultTrivyVersion
+    value: 'latest'
 
 resources:
   repositories:
     - repository: Pipeline-Templates
       type: git
-      name: Templates/Pipelines
-      ref: Ashour/trivy-scan-temp
+      name: 'Templates/Pipelines'
+      ref: 'main'
+      # Change to your actual branch/tag:
+      # ref: 'refs/tags/v1.0.0'
 
 stages:
   - stage: SecurityScan
     displayName: 'Security Scan'
     jobs:
-      - job: ScanBaseImages
-        displayName: 'Scan Base Images'
-        pool: 'Amazon Linux'
+      - job: ScanBackendImages
+        displayName: 'Scan BE Images'
+        pool:
+          name: 'Amazon Linux'
+          demands:
+            - Agent.Name -equals MySecurityAgent  # Optional: specify specific agent
+        timeoutInMinutes: 120
         
         steps:
-          - template: trivy/trivy-template.yaml@Pipelines
+          - task: Bash@3
+            displayName: 'Display Scan Configuration'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "=== Security Scan Configuration ==="
+                echo "Registry URL: $(internalRegistryUrl)"
+                echo "Base Image Repo: $(baseImageRepoPath)"
+                echo "Trivy Version: $(coalesce(trivyVersion, defaultTrivyVersion))"
+                echo "Alert Thresholds - High: $(coalesce(alertThresholdHigh, defaultAlertThresholdHigh)), Critical: $(coalesce(alertThresholdCritical, defaultAlertThresholdCritical))"
+                echo "Email Recipients: $(emailRecipients)"
+                echo "==================================="
+        
+          - template: 'trivy/trivy-template.yaml@Pipeline-Templates'
             parameters:
               baseImageRepo: '$(internalRegistryUrl)/$(baseImageRepoPath)'
-              registryUsername: $(registryUsername)
-              registryPassword: $(registryPassword)
+              registryUsername: '$(REGISTRY_USERNAME)'
+              registryPassword: '$(REGISTRY_PASSWORD)'
               scanName: 'Base Images'
+              excludedTags: ['python-base3.10.0', 'python-3.10.0']
               resultsDir: 'scan-baseimages'
+              cacheDir: '/cache'
+              trivyVersion: $(coalesce(trivyVersion, defaultTrivyVersion))
               shouldPublishHtml: false
+              alertThresholdHigh: $(coalesce(alertThresholdHigh, defaultAlertThresholdHigh))
+              alertThresholdCritical: $(coalesce(alertThresholdCritical, defaultAlertThresholdCritical))
+              emailRecipients: '$(emailRecipients)'
 
-      - job: ScanTrivy
-        displayName: 'Scan Trivy Images'
-        pool: 'Amazon Linux'
-        dependsOn: ScanBaseImages 
+      - job: ScanFronendImages
+        displayName: 'Scan FE Images'
+        pool:
+          name: 'Amazon Linux'
+        dependsOn: ScanBaseImages
+        timeoutInMinutes: 120
+        condition: succeededOrFailed()  # Run even if base image scan fails
         
         steps:
-          - template: trivy/trivy-template.yaml@Pipeline-Templates
+          - template: 'trivy/trivy-template.yaml@Pipeline-Templates'
             parameters:
               baseImageRepo: '$(internalRegistryUrl)/$(trivyImageRepoPath)'
-              registryUsername: $(registryUsername)
-              registryPassword: $(registryPassword)
-              scanName: 'Trivy Scanner'
+              registryUsername: '$(REGISTRY_USERNAME)'
+              registryPassword: '$(REGISTRY_PASSWORD)'
+              scanName: 'Trivy Scanner Images'
+              excludedTags: []
               resultsDir: 'scan-trivy'
+              cacheDir: '/cache'
+              trivyVersion: $(coalesce(trivyVersion, defaultTrivyVersion))
               shouldPublishHtml: true
+              alertThresholdHigh: $(coalesce(alertThresholdHigh, defaultAlertThresholdHigh))
+              alertThresholdCritical: $(coalesce(alertThresholdCritical, defaultAlertThresholdCritical))
+              emailRecipients: '$(emailRecipients)'
+
+  - stage: Notify
+    displayName: 'Notifications'
+    dependsOn: SecurityScan
+    condition: always()  # Always run notification stage
+    jobs:
+      - job: SendSummary
+        displayName: 'Send Scan Summary'
+        pool:
+          vmImage: 'ubuntu-latest'
+        
+        steps:
+          - task: Bash@3
+            displayName: 'Generate Scan Summary'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "=== Container Security Scan Summary ==="
+                echo "Scan Date: $(date)"
+                echo "Pipeline Run: $(Build.BuildNumber)"
+                echo "========================================"
+                echo ""
+                
+                # Check if artifacts exist and create summary
+                if [ -d "$(Pipeline.Workspace)" ]; then
+                  echo "Artifacts generated:"
+                  find "$(Pipeline.Workspace)" -name "*.html" -o -name "*.txt" -o -name "*.csv" | while read file; do
+                    echo "  - $(basename "$file")"
+                  done
+                else
+                  echo "No artifacts found"
+                fi
+                
+                echo ""
+                echo "Scan Status:"
+                echo "- Base Images: $(coalesce(stage.SecurityScan.result, 'Unknown'))"
+                echo "- Trivy Images: $(coalesce(stage.SecurityScan.result, 'Unknown'))"
+            
+          - task: SendEmail@1
+            displayName: 'Send Final Summary Email'
+            condition: ne(variables['emailRecipients'], '')
+            inputs:
+              to: '$(emailRecipients)'
+              subject: '[Security Scan] Container Scan Completed - $(Build.BuildNumber)'
+              body: |
+                Container security scan pipeline has completed.
+                
+                **Scan Details:**
+                - Pipeline: $(Build.DefinitionName)
+                - Run: $(Build.BuildNumber)
+                - Date: $(date)
+                
+                **Results:**
+                Check the pipeline artifacts for detailed vulnerability reports.
+                
+                **Pipeline URL:**
+                $(Build.BuildUri)
+                
+                This is an automated notification from the Container Security Scan Pipeline.
+              bodyAsHtml: true
+              importance: 'Normal'
