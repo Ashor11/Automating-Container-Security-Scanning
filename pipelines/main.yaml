@@ -1,0 +1,61 @@
+# =========================
+# Container Security Scan Pipeline
+# =========================
+
+schedules:
+  - cron: "0 1 * * *"
+    displayName: Daily container security scan at 4 AM Egypt time [4-3 = 1 UTC]
+    branches:
+      include:
+        - "*"
+trigger: none
+pr: none
+
+variables:
+  - group: libers
+  - name: internalRegistryUrl
+    value: '$(INTERNAL_REGISTRY_URL)'
+  - name: baseImageRepoPath
+    value: '$(BASE_IMAGE_REPO_PATH)'
+  - name: trivyImageRepoPath
+    value: '$(TRIVY_IMAGE_REPO_PATH)'
+
+resources:
+  repositories:
+    - repository: Pipeline-Templates
+      type: git
+      name: Templates/Pipelines
+      ref: Ashour/trivy-scan-temp
+
+stages:
+  - stage: SecurityScan
+    displayName: 'Security Scan'
+    jobs:
+      - job: ScanBaseImages
+        displayName: 'Scan Base Images'
+        pool: 'Amazon Linux'
+        
+        steps:
+          - template: trivy/trivy-template.yaml@Pipelines
+            parameters:
+              baseImageRepo: '$(internalRegistryUrl)/$(baseImageRepoPath)'
+              registryUsername: $(registryUsername)
+              registryPassword: $(registryPassword)
+              scanName: 'Base Images'
+              resultsDir: 'scan-baseimages'
+              shouldPublishHtml: false
+
+      - job: ScanTrivy
+        displayName: 'Scan Trivy Images'
+        pool: 'Amazon Linux'
+        dependsOn: ScanBaseImages 
+        
+        steps:
+          - template: trivy/trivy-template.yaml@Pipeline-Templates
+            parameters:
+              baseImageRepo: '$(internalRegistryUrl)/$(trivyImageRepoPath)'
+              registryUsername: $(registryUsername)
+              registryPassword: $(registryPassword)
+              scanName: 'Trivy Scanner'
+              resultsDir: 'scan-trivy'
+              shouldPublishHtml: true
