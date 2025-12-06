@@ -1,1 +1,6 @@
+
+chmod +x /trivy/scripts/scan-images.sh
+
+crontab -e
+
 0 3 * * 0 trivy/scripts/update-trivy.sh
